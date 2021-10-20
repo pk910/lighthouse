@@ -320,7 +320,6 @@ impl<TSpec: EthSpec> Service<TSpec> {
                     peer_id,
                     endpoint,
                     num_established,
-                    concurrent_dial_errors: _,
                 } => {
                     // Inform the peer manager.
                     // We require the ENR to inject into the peer db, if it exists.
@@ -365,17 +364,20 @@ impl<TSpec: EthSpec> Service<TSpec> {
                 SwarmEvent::BannedPeer { peer_id, .. } => {
                     debug!(self.log, "Banned peer connection rejected"; "peer_id" => %peer_id);
                 }
-                SwarmEvent::OutgoingConnectionError {
+                SwarmEvent::UnreachableAddr {
                     peer_id,
                     error,
+                    attempts_remaining: _,
+                    address: _,
                 } => {
                     debug!(self.log, "Failed to dial address"; "peer_id" => ?peer_id,  "error" => %error);
-                    if let Some(peer_id) = peer_id {
                     self.swarm
                         .behaviour_mut()
                         .peer_manager_mut()
                         .inject_dial_failure(&peer_id);
-                    }
+                }
+                SwarmEvent::UnknownPeerUnreachableAddr  { address, .. }  =>{ 
+                    debug!(self.log, "Unreachable addr"; "addr" => ?address);
                 }
                 SwarmEvent::ExpiredListenAddr { address, .. } => {
                     debug!(self.log, "Listen address expired"; "address" => %address)

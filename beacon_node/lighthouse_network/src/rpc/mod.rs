@@ -220,7 +220,6 @@ where
         _peer_id: &PeerId,
         _connection_id: &ConnectionId,
         _endpoint: &ConnectedPoint,
-        _failed_addresses: Option<&Vec<Multiaddr>>,
     ) {
     }
 

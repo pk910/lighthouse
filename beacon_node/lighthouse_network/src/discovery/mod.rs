@@ -936,7 +936,6 @@ impl<TSpec: EthSpec> NetworkBehaviour for Discovery<TSpec> {
         _peer_id: &PeerId,
         _connection_id: &ConnectionId,
         _endpoint: &ConnectedPoint,
-        _failed_addresses: Option<&Vec<Multiaddr>>,
     ) {
     }
     fn inject_connection_closed(
@@ -957,15 +956,13 @@ impl<TSpec: EthSpec> NetworkBehaviour for Discovery<TSpec> {
 
     fn inject_dial_failure(
         &mut self,
-        peer_id: Option<PeerId>,
+        peer_id: &PeerId,
         _handler: Self::ProtocolsHandler,
-        _error: &DialError,
+        _error: DialError,
     ) {
-        if let Some(peer_id) = peer_id {
             // set peer as disconnected in discovery DHT
             debug!(self.log, "Marking peer disconnected in DHT"; "peer_id" => %peer_id);
             self.disconnect_peer(&peer_id);
-        }
     }
 
     // Main execution loop to drive the behaviour
