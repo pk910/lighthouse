@@ -40,7 +40,9 @@ strum = { version = "0.21.0", features = ["derive"] }
 superstruct = "0.2.0"
 
 [dependencies.libp2p]
-version = "0.40.0-rc.3"
+# version = "0.40.0-rc.3"
+git = "https://github.com/sigp/rust-libp2p"
+branch = "bandwidth_identify_patch"
 default-features = false
 features = ["websocket", "identify", "mplex", "yamux", "noise", "gossipsub", "dns-tokio", "tcp-tokio"]
 
