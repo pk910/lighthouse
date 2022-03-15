@@ -145,6 +145,7 @@ impl<T: SlotClock + 'static, E: EthSpec> AttestationService<T, E> {
                     sleep(duration_to_next_slot + slot_duration / 3).await;
                     let log = self.context.log();
 
+                    /*
                     if let Err(e) = self.spawn_attestation_tasks(slot_duration) {
                         crit!(
                             log,
@@ -157,6 +158,7 @@ impl<T: SlotClock + 'static, E: EthSpec> AttestationService<T, E> {
                             "Spawned attestation tasks";
                         )
                     }
+                    */
                 } else {
                     error!(log, "Failed to read slot clock");
                     // If we can't read the slot clock, just wait another slot.
