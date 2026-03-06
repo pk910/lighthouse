@@ -1225,6 +1225,18 @@ pub fn cli_app() -> Command {
                 .display_order(0)
         )
         .arg(
+            Arg::new("checkpoint-sync-unfinalized")
+                .long("checkpoint-sync-unfinalized")
+                .help("When used with --checkpoint-sync-url, sync from the latest epoch-start \
+                       state instead of the finalized state. This is useful when finalization \
+                       is broken and the finalized state is very old. WARNING: This is unsafe \
+                       and may cause the node to follow a minority chain.")
+                .action(ArgAction::SetTrue)
+                .requires("checkpoint-sync-url")
+                .help_heading(FLAG_HEADER)
+                .display_order(0)
+        )
+        .arg(
             Arg::new("checkpoint-sync-url-timeout")
                 .long("checkpoint-sync-url-timeout")
                 .help("Set the timeout for checkpoint sync calls to remote beacon node HTTP endpoint.")

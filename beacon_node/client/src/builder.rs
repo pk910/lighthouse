@@ -250,6 +250,7 @@ where
         } else if chain_exists {
             if matches!(client_genesis, ClientGenesis::WeakSubjSszBytes { .. })
                 || matches!(client_genesis, ClientGenesis::CheckpointSyncUrl { .. })
+                || matches!(client_genesis, ClientGenesis::CheckpointSyncUrlUnfinalized { .. })
             {
                 info!(
                     msg = "database already exists, use --purge-db to force checkpoint sync",
@@ -455,6 +456,113 @@ where
                 );
 
                 builder.weak_subjectivity_state(state, block, blobs, genesis_state)?
+            }
+            ClientGenesis::CheckpointSyncUrlUnfinalized { url } => {
+                info!(
+                    remote_url = %url,
+                    "Starting checkpoint sync (unfinalized states allowed)"
+                );
+                if config.chain.genesis_backfill {
+                    info!("Blocks will be downloaded all the way back to genesis");
+                }
+
+                let remote = BeaconNodeHttpClient::new(
+                    url,
+                    Timeouts::set_all(Duration::from_secs(
+                        config.chain.checkpoint_sync_url_timeout,
+                    )),
+                );
+
+                debug!("Downloading checkpoint state");
+                let state = remote
+                    .get_debug_beacon_states_ssz::<E>(StateId::Checkpoint, &spec)
+                    .await
+                    .map_err(|e| format!("Error loading checkpoint state from remote: {:?}", e))?
+                    .ok_or_else(|| "Checkpoint state missing from remote".to_string())?;
+
+                debug!(slot = ?state.slot(), "Downloaded checkpoint state");
+
+                let block_slot = state.latest_block_header().slot;
+
+                debug!(block_slot = ?block_slot, "Downloading block for checkpoint state");
+                let block = remote
+                    .get_beacon_blocks_ssz::<E>(BlockId::Checkpoint, &spec)
+                    .await
+                    .map_err(|e| format!("Error fetching block from remote: {:?}", e))?
+                    .ok_or("Block missing from remote for checkpoint state")?;
+                let block_root = block.canonical_root();
+
+                debug!("Downloaded block for checkpoint state");
+
+                // `get_blob_sidecars` API is deprecated from Fulu and may not be supported
+                // by all servers
+                let is_before_fulu = !spec
+                    .fork_name_at_slot::<E>(block_slot)
+                    .fulu_enabled();
+                let blobs = if is_before_fulu && block.message().body().has_blobs() {
+                    debug!("Downloading blobs");
+                    if let Some(response) = remote
+                        .get_blob_sidecars::<E>(BlockId::Root(block_root), None, &spec)
+                        .await
+                        .map_err(|e| format!("Error fetching blobs from remote: {e:?}"))?
+                    {
+                        debug!("Downloaded blobs");
+                        Some(response.into_data())
+                    } else {
+                        warn!(
+                            block_root = %block_root,
+                            hint = "use a different URL or ask the provider to update",
+                            impact = "db will be slightly corrupt until these blobs are pruned",
+                            "Checkpoint server is missing blobs"
+                        );
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let genesis_state = genesis_state(&runtime_context, &config).await?;
+
+                // Auto-detect whether the state is finalized or unfinalized by comparing
+                // its epoch against the network's current finalized epoch. We fetch the
+                // finalized epoch via a separate API call rather than using the state's
+                // internal finalized_checkpoint, because after a long non-finalization
+                // period followed by recovery, the newly finalized state still contains
+                // the old (stale) finalized_checkpoint internally.
+                let state_epoch = state.slot().epoch(E::slots_per_epoch());
+                let network_finalized_epoch = remote
+                    .get_beacon_states_finality_checkpoints(StateId::Head)
+                    .await
+                    .map_err(|e| format!("Error fetching finality checkpoints: {:?}", e))?
+                    .map(|resp| resp.data.finalized.epoch)
+                    .unwrap_or_else(|| {
+                        warn!("Failed to fetch finality checkpoints, falling back to state-internal check");
+                        state.finalized_checkpoint().epoch
+                    });
+                let is_unfinalized = state_epoch > network_finalized_epoch;
+
+                if is_unfinalized {
+                    warn!(
+                        block_slot = %block.slot(),
+                        state_slot = %state.slot(),
+                        block_root = ?block_root,
+                        state_epoch = %state_epoch,
+                        network_finalized_epoch = %network_finalized_epoch,
+                        justified_epoch = %state.current_justified_checkpoint().epoch,
+                        "Detected UNFINALIZED checkpoint state"
+                    );
+                    builder.weak_subjectivity_state_unfinalized(state, block, blobs, genesis_state)?
+                } else {
+                    info!(
+                        block_slot = %block.slot(),
+                        state_slot = %state.slot(),
+                        block_root = ?block_root,
+                        state_epoch = %state_epoch,
+                        network_finalized_epoch = %network_finalized_epoch,
+                        "Checkpoint state is finalized, using standard init path"
+                    );
+                    builder.weak_subjectivity_state(state, block, blobs, genesis_state)?
+                }
             }
             ClientGenesis::DepositContract => {
                 return Err("Loading genesis from deposit contract no longer supported".to_string());

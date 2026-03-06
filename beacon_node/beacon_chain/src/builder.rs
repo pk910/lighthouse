@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use store::{Error as StoreError, HotColdDB, ItemStore, KeyValueStoreOp};
 use task_executor::{ShutdownReason, TaskExecutor};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use tree_hash::TreeHash;
 use types::data::CustodyIndex;
 use types::{
@@ -627,6 +627,238 @@ where
             .map_err(|e| format!("Unable to initialize fork choice store: {e:?}"))?;
 
         let fork_choice = ForkChoice::from_anchor(
+            fc_store,
+            snapshot.beacon_block_root,
+            &snapshot.beacon_block,
+            &snapshot.beacon_state,
+            Some(weak_subj_slot),
+            &self.spec,
+        )
+        .map_err(|e| format!("Unable to initialize ForkChoice: {:?}", e))?;
+
+        self.fork_choice = Some(fork_choice);
+
+        Ok(self.empty_op_pool())
+    }
+
+    /// Start the chain from an unfinalized weak subjectivity state.
+    ///
+    /// This is similar to `weak_subjectivity_state` but preserves the state's actual finalized
+    /// and justified checkpoints instead of treating the anchor block as finalized. Fork choice
+    /// is initialized with dummy proto-array nodes forming a chain:
+    ///   finalized -> justified -> parent -> head
+    ///
+    /// This enables checkpoint sync from non-finalizing networks where the finalized state is
+    /// too old to be useful.
+    pub fn weak_subjectivity_state_unfinalized(
+        mut self,
+        mut weak_subj_state: BeaconState<E>,
+        weak_subj_block: SignedBeaconBlock<E>,
+        weak_subj_blobs: Option<BlobSidecarList<E>>,
+        genesis_state: BeaconState<E>,
+    ) -> Result<Self, String> {
+        let store = self
+            .store
+            .clone()
+            .ok_or("weak_subjectivity_state_unfinalized requires a store")?;
+
+        // Ensure the state is advanced to an epoch boundary for storage alignment.
+        let slots_per_epoch = E::slots_per_epoch();
+        if weak_subj_state.slot() % slots_per_epoch != 0 {
+            debug!(
+                state_slot = %weak_subj_state.slot(),
+                block_slot = %weak_subj_block.slot(),
+                "Advancing unfinalized checkpoint state to epoch boundary"
+            );
+            while weak_subj_state.slot() % slots_per_epoch != 0 {
+                per_slot_processing(&mut weak_subj_state, None, &self.spec)
+                    .map_err(|e| format!("Error advancing state: {e:?}"))?;
+            }
+        }
+
+        // Prime all caches before storing the state in the database and computing the tree hash
+        // root.
+        weak_subj_state
+            .build_all_caches(&self.spec)
+            .map_err(|e| format!("Error building caches on checkpoint state: {e:?}"))?;
+        let weak_subj_state_root = weak_subj_state
+            .update_tree_hash_cache()
+            .map_err(|e| format!("Error computing checkpoint state root: {:?}", e))?;
+
+        let weak_subj_slot = weak_subj_state.slot();
+        let weak_subj_block_root = weak_subj_block.canonical_root();
+
+        // Validate the state's `latest_block_header` against the checkpoint block.
+        let state_latest_block_root = weak_subj_state.get_latest_block_root(weak_subj_state_root);
+        if weak_subj_block_root != state_latest_block_root {
+            return Err(format!(
+                "Snapshot state's most recent block root does not match block, expected: {:?}, got: {:?}",
+                weak_subj_block_root, state_latest_block_root
+            ));
+        }
+
+        // Check that the checkpoint state is for the same network as the genesis state.
+        // This check doesn't do much for security but should prevent mistakes.
+        if weak_subj_state.genesis_validators_root() != genesis_state.genesis_validators_root() {
+            return Err(format!(
+                "Snapshot state appears to be from the wrong network. Genesis validators root \
+                 is {:?} but should be {:?}",
+                weak_subj_state.genesis_validators_root(),
+                genesis_state.genesis_validators_root()
+            ));
+        }
+
+        // Verify that blobs (if provided) match the block.
+        if let Some(blobs) = &weak_subj_blobs {
+            let fulu_enabled = weak_subj_block.fork_name_unchecked().fulu_enabled();
+            if fulu_enabled && blobs.is_empty() {
+                // Blobs expected for this block, but the checkpoint server is not able to serve
+                // them. This is expected from Fulu, as only supernodes are able to serve blobs.
+                // https://github.com/sigp/lighthouse/issues/6837
+            } else {
+                let commitments = weak_subj_block
+                    .message()
+                    .body()
+                    .blob_kzg_commitments()
+                    .map_err(|e| {
+                        format!("Blobs provided but block does not reference them: {e:?}")
+                    })?;
+                if blobs.len() != commitments.len() {
+                    return Err(format!(
+                        "Wrong number of blobs, expected: {}, got: {}",
+                        commitments.len(),
+                        blobs.len()
+                    ));
+                }
+                if commitments
+                    .iter()
+                    .zip(blobs.iter())
+                    .any(|(commitment, blob)| *commitment != blob.kzg_commitment)
+                {
+                    return Err("Checkpoint blob does not match block commitment".into());
+                }
+            }
+        }
+
+        warn!(
+            slot = %weak_subj_slot,
+            state_root = ?weak_subj_state_root,
+            block_root = ?weak_subj_block_root,
+            finalized_epoch = %weak_subj_state.finalized_checkpoint().epoch,
+            justified_epoch = %weak_subj_state.current_justified_checkpoint().epoch,
+            "Storing split from UNFINALIZED weak subjectivity state"
+        );
+
+        // Set the store's split point *before* storing genesis so that if the genesis state
+        // is prior to the split slot, it will immediately be stored in the freezer DB.
+        store.set_split(weak_subj_slot, weak_subj_state_root, weak_subj_block_root);
+
+        // It is also possible for the checkpoint state to be equal to the genesis state, in which
+        // case it will be stored in the hot DB. In this case, we need to ensure the store's anchor
+        // is initialised prior to storing the state, as the anchor is required for working out
+        // hdiff storage strategies.
+        let retain_historic_states = self.chain_config.reconstruct_historic_states;
+        self.pending_io_batch.push(
+            store
+                .init_anchor_info(
+                    weak_subj_block.parent_root(),
+                    weak_subj_block.slot(),
+                    weak_subj_slot,
+                    retain_historic_states,
+                )
+                .map_err(|e| format!("Failed to initialize anchor info: {:?}", e))?,
+        );
+
+        let (_, updated_builder) = self.set_genesis_state(genesis_state)?;
+        self = updated_builder;
+
+        // Fill in the linear block roots between the checkpoint block's slot and the aligned
+        // state's slot. All slots less than the block's slot will be handled by block backfill,
+        // while states greater or equal to the checkpoint state will be handled by `migrate_db`.
+        let block_root_batch = store
+            .store_frozen_block_root_at_skip_slots(
+                weak_subj_block.slot(),
+                weak_subj_state.slot(),
+                weak_subj_block_root,
+            )
+            .map_err(|e| format!("Error writing frozen block roots: {e:?}"))?;
+        store
+            .cold_db
+            .do_atomically(block_root_batch)
+            .map_err(|e| format!("Error writing frozen block roots: {e:?}"))?;
+        debug!(
+            from = %weak_subj_block.slot(),
+            to_excl = %weak_subj_state.slot(),
+            block_root = ?weak_subj_block_root,
+            "Stored frozen block roots at skipped slots"
+        );
+
+        // Write the state, block and blobs non-atomically, it doesn't matter if they're forgotten
+        // about on a crash restart.
+        store
+            .update_finalized_state(
+                weak_subj_state_root,
+                weak_subj_block_root,
+                weak_subj_state.clone(),
+            )
+            .map_err(|e| format!("Failed to set checkpoint state as finalized state: {:?}", e))?;
+        // Note: post hot hdiff must update the anchor info before attempting to put_state otherwise
+        // the write will fail if the weak_subj_slot is not aligned with the snapshot moduli.
+        store
+            .put_state(&weak_subj_state_root, &weak_subj_state)
+            .map_err(|e| format!("Failed to store weak subjectivity state: {e:?}"))?;
+        store
+            .put_block(&weak_subj_block_root, weak_subj_block.clone())
+            .map_err(|e| format!("Failed to store weak subjectivity block: {e:?}"))?;
+        if let Some(blobs) = weak_subj_blobs {
+            if self
+                .spec
+                .is_peer_das_enabled_for_epoch(weak_subj_block.epoch())
+            {
+                // After PeerDAS recompute columns from blobs to not force the checkpointz server
+                // into exposing another route.
+                let data_columns =
+                    build_data_columns_from_blobs(&weak_subj_block, &blobs, &self.kzg, &self.spec)?;
+                // TODO(das): only persist the columns under custody
+                store
+                    .put_data_columns(&weak_subj_block_root, data_columns)
+                    .map_err(|e| format!("Failed to store weak subjectivity data_column: {e:?}"))?;
+            } else {
+                store
+                    .put_blobs(&weak_subj_block_root, blobs)
+                    .map_err(|e| format!("Failed to store weak subjectivity blobs: {e:?}"))?;
+            }
+        }
+
+        // Stage the database's metadata fields for atomic storage when `build` is called.
+        // This prevents the database from restarting in an inconsistent state if the anchor
+        // info or split point is written before the `PersistedBeaconChain`.
+        self.pending_io_batch.push(store.store_split_in_batch());
+        self.pending_io_batch.push(
+            store
+                .init_blob_info(weak_subj_block.slot())
+                .map_err(|e| format!("Failed to initialize blob info: {:?}", e))?,
+        );
+        self.pending_io_batch.push(
+            store
+                .init_data_column_info(weak_subj_block.slot())
+                .map_err(|e| format!("Failed to initialize data column info: {:?}", e))?,
+        );
+
+        let snapshot = BeaconSnapshot {
+            beacon_block_root: weak_subj_block_root,
+            beacon_block: Arc::new(weak_subj_block),
+            beacon_state: weak_subj_state,
+        };
+
+        // Use the unfinalized fork choice store which preserves the state's actual finalized
+        // and justified checkpoints, then initialize fork choice with dummy proto-array nodes.
+        let fc_store = BeaconForkChoiceStore::get_forkchoice_store_unfinalized(
+            store, snapshot.clone(),
+        )
+        .map_err(|e| format!("Unable to initialize fork choice store: {e:?}"))?;
+
+        let fork_choice = ForkChoice::from_unfinalized_anchor(
             fc_store,
             snapshot.beacon_block_root,
             &snapshot.beacon_block,

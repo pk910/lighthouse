@@ -215,6 +215,55 @@ where
         })
     }
 
+    /// Create a fork choice store from an unfinalized anchor state.
+    ///
+    /// Unlike `get_forkchoice_store`, this preserves the state's actual finalized and justified
+    /// checkpoints instead of treating the anchor as the finalized block. This is used for
+    /// checkpoint sync from non-finalizing networks.
+    pub fn get_forkchoice_store_unfinalized(
+        store: Arc<HotColdDB<E, Hot, Cold>>,
+        anchor: BeaconSnapshot<E>,
+    ) -> Result<Self, Error> {
+        let mut anchor_state = anchor.beacon_state;
+        let anchor_block_header = anchor_state.latest_block_header().clone();
+
+        // The anchor state MUST be on an epoch boundary.
+        if !anchor_state
+            .slot()
+            .as_u64()
+            .is_multiple_of(E::slots_per_epoch())
+        {
+            return Err(Error::UnalignedCheckpoint {
+                block_slot: anchor_block_header.slot,
+                state_slot: anchor_state.slot(),
+            });
+        }
+
+        // Use the state's actual finalized and justified checkpoints rather than faking them
+        // from the anchor block's epoch.
+        let finalized_checkpoint = anchor_state.finalized_checkpoint();
+        let justified_checkpoint = anchor_state.current_justified_checkpoint();
+
+        let justified_balances = JustifiedBalances::from_justified_state(&anchor_state)?;
+        let justified_state_root = anchor_state.canonical_root()?;
+
+        Ok(Self {
+            store,
+            balances_cache: <_>::default(),
+            time: anchor_state.slot(),
+            justified_checkpoint,
+            justified_balances,
+            justified_state_root,
+            finalized_checkpoint,
+            unrealized_justified_checkpoint: justified_checkpoint,
+            unrealized_justified_state_root: justified_state_root,
+            unrealized_finalized_checkpoint: finalized_checkpoint,
+            proposer_boost_root: Hash256::zero(),
+            equivocating_indices: BTreeSet::new(),
+            _phantom: PhantomData,
+        })
+    }
+
     /// Save the current state of `Self` to a `PersistedForkChoiceStore` which can be stored to the
     /// on-disk database.
     pub fn to_persisted(&self) -> PersistedForkChoiceStore {

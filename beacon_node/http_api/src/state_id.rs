@@ -52,6 +52,18 @@ impl StateId {
                     checkpoint_slot_and_execution_optimistic(chain, justified_checkpoint)?;
                 (slot, execution_optimistic, false)
             }
+            CoreStateId::Checkpoint => {
+                // Return the head state - clients handle epoch alignment themselves
+                let (cached_head, execution_status) = chain
+                    .canonical_head
+                    .head_and_execution_status()
+                    .map_err(warp_utils::reject::unhandled_error)?;
+                return Ok((
+                    cached_head.head_state_root(),
+                    execution_status.is_optimistic_or_invalid(),
+                    false,
+                ));
+            }
             CoreStateId::Slot(slot) => (
                 *slot,
                 chain

@@ -540,7 +540,11 @@ pub fn get_config<E: EthSpec>(
             let url = SensitiveUrl::parse(remote_bn_url)
                 .map_err(|e| format!("Invalid checkpoint sync URL: {:?}", e))?;
 
-            ClientGenesis::CheckpointSyncUrl { url }
+            if parse_flag(cli_args, "checkpoint-sync-unfinalized") {
+                ClientGenesis::CheckpointSyncUrlUnfinalized { url }
+            } else {
+                ClientGenesis::CheckpointSyncUrl { url }
+            }
         } else {
             ClientGenesis::GenesisState
         }

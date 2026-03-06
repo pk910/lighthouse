@@ -418,6 +418,84 @@ where
         Ok(fork_choice)
     }
 
+    /// Instantiates `Self` from an unfinalized anchor state.
+    ///
+    /// Creates a chain of dummy proto-array nodes:
+    ///   finalized -> justified -> parent -> head
+    ///
+    /// Uses the state's actual finalized/justified checkpoints instead of
+    /// faking them from the anchor block's epoch.
+    pub fn from_unfinalized_anchor(
+        fc_store: T,
+        anchor_block_root: Hash256,
+        anchor_block: &SignedBeaconBlock<E>,
+        anchor_state: &BeaconState<E>,
+        current_slot: Option<Slot>,
+        spec: &ChainSpec,
+    ) -> Result<Self, Error<T::Error>> {
+        // Sanity check: the anchor must lie on an epoch boundary.
+        if anchor_state.slot() % E::slots_per_epoch() != 0 {
+            return Err(Error::InvalidAnchor {
+                block_slot: anchor_block.slot(),
+                state_slot: anchor_state.slot(),
+            });
+        }
+
+        let head_block_slot = anchor_block.slot();
+        let head_block_state_root = anchor_block.state_root();
+        let head_block_parent_root = anchor_block.message().parent_root();
+        let current_epoch_shuffling_id =
+            AttestationShufflingId::new(anchor_block_root, anchor_state, RelativeEpoch::Current)
+                .map_err(Error::BeaconStateError)?;
+        let next_epoch_shuffling_id =
+            AttestationShufflingId::new(anchor_block_root, anchor_state, RelativeEpoch::Next)
+                .map_err(Error::BeaconStateError)?;
+
+        let execution_status = anchor_block.message().execution_payload().map_or_else(
+            |_| ExecutionStatus::irrelevant(),
+            |execution_payload| {
+                if execution_payload.is_default_with_empty_roots() {
+                    ExecutionStatus::irrelevant()
+                } else {
+                    // Mark as syncing since this is an unfinalized state
+                    ExecutionStatus::Optimistic(execution_payload.block_hash())
+                }
+            },
+        );
+
+        let current_slot = current_slot.unwrap_or_else(|| fc_store.get_current_slot());
+
+        let proto_array = ProtoArrayForkChoice::new_unfinalized::<E>(
+            current_slot,
+            head_block_slot,
+            anchor_block_root,
+            head_block_parent_root,
+            head_block_state_root,
+            *fc_store.justified_checkpoint(),
+            *fc_store.finalized_checkpoint(),
+            current_epoch_shuffling_id,
+            next_epoch_shuffling_id,
+            execution_status,
+        )?;
+
+        let mut fork_choice = Self {
+            fc_store,
+            proto_array,
+            queued_attestations: vec![],
+            forkchoice_update_parameters: ForkchoiceUpdateParameters {
+                head_hash: None,
+                justified_hash: None,
+                finalized_hash: None,
+                head_root: Hash256::zero(),
+            },
+            _phantom: PhantomData,
+        };
+
+        fork_choice.get_head(current_slot, spec)?;
+
+        Ok(fork_choice)
+    }
+
     /// Returns cached information that can be used to issue a `forkchoiceUpdated` message to an
     /// execution engine.
     ///
