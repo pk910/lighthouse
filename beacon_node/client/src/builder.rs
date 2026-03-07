@@ -533,12 +533,11 @@ where
                 let network_finalized_epoch = remote
                     .get_beacon_states_finality_checkpoints(StateId::Head)
                     .await
-                    .map_err(|e| format!("Error fetching finality checkpoints: {:?}", e))?
-                    .map(|resp| resp.data.finalized.epoch)
-                    .unwrap_or_else(|| {
-                        warn!("Failed to fetch finality checkpoints, falling back to state-internal check");
-                        state.finalized_checkpoint().epoch
-                    });
+                    .map_err(|e| format!("Error fetching finality checkpoints from checkpoint sync source: {:?}", e))?
+                    .ok_or("Finality checkpoints not available from checkpoint sync source")?
+                    .data
+                    .finalized
+                    .epoch;
                 let is_unfinalized = state_epoch > network_finalized_epoch;
 
                 if is_unfinalized {
