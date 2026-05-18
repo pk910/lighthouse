@@ -1149,14 +1149,21 @@ impl<E: EthSpec, Hot: ItemStore<E>, Cold: ItemStore<E>> HotColdDB<E, Hot, Cold> 
         }
 
         // Sanity check max-slot against the split slot.
-        if max_slot < split.slot {
+        // If the requested slot is before the split but the block_root matches the
+        // split block (e.g., during unfinalized checkpoint sync where the split state
+        // is advanced past the anchor block), use the split slot instead of erroring.
+        let max_slot = if max_slot < split.slot && block_root == split.block_root {
+            split.slot
+        } else if max_slot < split.slot {
             return Err(HotColdDBError::FinalizedStateNotInHotDatabase {
                 split_slot: split.slot,
                 request_slot: max_slot,
                 block_root,
             }
             .into());
-        }
+        } else {
+            max_slot
+        };
 
         let state_root = if block_root == split.block_root && split.slot <= max_slot {
             split.state_root

@@ -74,6 +74,7 @@ pub enum BlockId {
     Genesis,
     Finalized,
     Justified,
+    Checkpoint,
     Slot(Slot),
     Root(Hash256),
 }
@@ -87,6 +88,7 @@ impl FromStr for BlockId {
             "genesis" => Ok(BlockId::Genesis),
             "finalized" => Ok(BlockId::Finalized),
             "justified" => Ok(BlockId::Justified),
+            "checkpoint" => Ok(BlockId::Checkpoint),
             other => {
                 if other.starts_with("0x") {
                     Hash256::from_str(&s[2..])
@@ -110,6 +112,7 @@ impl fmt::Display for BlockId {
             BlockId::Genesis => write!(f, "genesis"),
             BlockId::Finalized => write!(f, "finalized"),
             BlockId::Justified => write!(f, "justified"),
+            BlockId::Checkpoint => write!(f, "checkpoint"),
             BlockId::Slot(slot) => write!(f, "{}", slot),
             BlockId::Root(root) => write!(f, "{:?}", root),
         }
@@ -122,6 +125,7 @@ pub enum StateId {
     Genesis,
     Finalized,
     Justified,
+    Checkpoint,
     Slot(Slot),
     Root(Hash256),
 }
@@ -135,6 +139,7 @@ impl FromStr for StateId {
             "genesis" => Ok(StateId::Genesis),
             "finalized" => Ok(StateId::Finalized),
             "justified" => Ok(StateId::Justified),
+            "checkpoint" => Ok(StateId::Checkpoint),
             other => {
                 if other.starts_with("0x") {
                     Hash256::from_str(&s[2..])
@@ -158,6 +163,7 @@ impl fmt::Display for StateId {
             StateId::Genesis => write!(f, "genesis"),
             StateId::Finalized => write!(f, "finalized"),
             StateId::Justified => write!(f, "justified"),
+            StateId::Checkpoint => write!(f, "checkpoint"),
             StateId::Slot(slot) => write!(f, "{}", slot),
             StateId::Root(root) => write!(f, "{:?}", root),
         }

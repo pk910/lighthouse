@@ -45,6 +45,9 @@ pub enum ClientGenesis {
     CheckpointSyncUrl {
         url: SensitiveUrl,
     },
+    CheckpointSyncUrlUnfinalized {
+        url: SensitiveUrl,
+    },
 }
 
 /// The core configuration of a Lighthouse beacon node.

@@ -136,6 +136,19 @@ impl BlockId {
                     )))
                 }
             }
+            CoreBlockId::Checkpoint => {
+                // Checkpoint block ID is used by checkpoint sync clients.
+                // On a local beacon node, it behaves like Head.
+                let (cached_head, execution_status) = chain
+                    .canonical_head
+                    .head_and_execution_status()
+                    .map_err(warp_utils::reject::unhandled_error)?;
+                Ok((
+                    cached_head.head_block_root(),
+                    execution_status.is_optimistic_or_invalid(),
+                    false,
+                ))
+            }
         }
     }
 

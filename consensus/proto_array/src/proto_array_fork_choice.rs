@@ -567,6 +567,158 @@ impl ProtoArrayForkChoice {
             .map_err(|e| format!("Failed to process execution payload: {:?}", e))
     }
 
+    /// Create a new `ProtoArrayForkChoice` for an unfinalized anchor state.
+    ///
+    /// Unlike `new()`, this creates a chain of 4 dummy proto-array nodes:
+    ///   finalized_block -> justified_block -> parent_block -> head_block
+    ///
+    /// This mirrors Lodestar's `initializeForkChoiceFromUnfinalizedState()` approach.
+    /// The finalized and justified checkpoints are the actual values from the anchor state,
+    /// not fake ones derived from the anchor block's epoch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_unfinalized<E: EthSpec>(
+        current_slot: Slot,
+        head_block_slot: Slot,
+        head_block_root: Hash256,
+        head_block_parent_root: Hash256,
+        head_block_state_root: Hash256,
+        justified_checkpoint: Checkpoint,
+        finalized_checkpoint: Checkpoint,
+        current_epoch_shuffling_id: AttestationShufflingId,
+        next_epoch_shuffling_id: AttestationShufflingId,
+        execution_status: ExecutionStatus,
+        execution_payload_parent_hash: Option<ExecutionBlockHash>,
+        execution_payload_block_hash: Option<ExecutionBlockHash>,
+        proposer_index: u64,
+        spec: &ChainSpec,
+    ) -> Result<Self, String> {
+        let mut proto_array = ProtoArray {
+            prune_threshold: DEFAULT_PRUNE_THRESHOLD,
+            nodes: Vec::with_capacity(4),
+            indices: HashMap::with_capacity(4),
+        };
+
+        let finalized_epoch_start_slot =
+            finalized_checkpoint.epoch.start_slot(E::slots_per_epoch());
+        let justified_epoch_start_slot =
+            justified_checkpoint.epoch.start_slot(E::slots_per_epoch());
+
+        // Use the same shuffling IDs for all dummy nodes (we don't have the real ones)
+        let dummy_shuffling_id = current_epoch_shuffling_id.clone();
+        let dummy_next_shuffling_id = next_epoch_shuffling_id.clone();
+
+        // 1. Finalized block (root of the proto-array tree)
+        let finalized_block = Block {
+            slot: finalized_epoch_start_slot,
+            root: finalized_checkpoint.root,
+            parent_root: None, // no parent for the finalized root
+            state_root: Hash256::zero(), // dummy - we don't have the actual state
+            target_root: finalized_checkpoint.root,
+            current_epoch_shuffling_id: dummy_shuffling_id.clone(),
+            next_epoch_shuffling_id: dummy_next_shuffling_id.clone(),
+            justified_checkpoint,
+            finalized_checkpoint,
+            execution_status,
+            unrealized_justified_checkpoint: Some(justified_checkpoint),
+            unrealized_finalized_checkpoint: Some(finalized_checkpoint),
+            // For Gloas, `on_block` requires payload hashes to be `Some`. The dummy
+            // ancestors are never used for real validation, so we reuse the anchor's
+            // payload hashes if they exist. The chain still resolves because the
+            // anchor's `execution_payload_parent_hash` matches the parent dummy block.
+            execution_payload_parent_hash,
+            execution_payload_block_hash: execution_payload_parent_hash,
+            // Dummy ancestors' proposer index is unknown; use the anchor block's index so
+            // `on_block` accepts the node (it rejects `None`).
+            proposer_index: Some(proposer_index),
+        };
+
+        proto_array
+            .on_block::<E>(finalized_block, current_slot, spec, Duration::ZERO)
+            .map_err(|e| format!("Failed to add finalized block to proto_array: {:?}", e))?;
+
+        // 2. Justified block (child of finalized)
+        let justified_block = Block {
+            slot: justified_epoch_start_slot,
+            root: justified_checkpoint.root,
+            parent_root: Some(finalized_checkpoint.root),
+            state_root: Hash256::zero(), // dummy
+            target_root: justified_checkpoint.root,
+            current_epoch_shuffling_id: dummy_shuffling_id.clone(),
+            next_epoch_shuffling_id: dummy_next_shuffling_id.clone(),
+            justified_checkpoint,
+            finalized_checkpoint,
+            execution_status,
+            unrealized_justified_checkpoint: Some(justified_checkpoint),
+            unrealized_finalized_checkpoint: Some(finalized_checkpoint),
+            execution_payload_parent_hash,
+            execution_payload_block_hash: execution_payload_parent_hash,
+            proposer_index: Some(proposer_index),
+        };
+
+        proto_array
+            .on_block::<E>(justified_block, current_slot, spec, Duration::ZERO)
+            .map_err(|e| format!("Failed to add justified block to proto_array: {:?}", e))?;
+
+        // 3. Parent block (child of justified, parent of head)
+        let parent_slot = head_block_slot
+            .as_u64()
+            .checked_sub(1)
+            .map(Slot::new)
+            .unwrap_or(head_block_slot);
+        let parent_block = Block {
+            slot: parent_slot,
+            root: head_block_parent_root,
+            parent_root: Some(justified_checkpoint.root),
+            state_root: Hash256::zero(), // dummy
+            target_root: head_block_parent_root,
+            current_epoch_shuffling_id: dummy_shuffling_id.clone(),
+            next_epoch_shuffling_id: dummy_next_shuffling_id.clone(),
+            justified_checkpoint,
+            finalized_checkpoint,
+            execution_status,
+            unrealized_justified_checkpoint: Some(justified_checkpoint),
+            unrealized_finalized_checkpoint: Some(finalized_checkpoint),
+            // For the immediate parent we use the anchor's payload parent hash so the
+            // optimistic chain links up to a valid EL block hash.
+            execution_payload_parent_hash,
+            execution_payload_block_hash: execution_payload_parent_hash,
+            proposer_index: Some(proposer_index),
+        };
+
+        proto_array
+            .on_block::<E>(parent_block, current_slot, spec, Duration::ZERO)
+            .map_err(|e| format!("Failed to add parent block to proto_array: {:?}", e))?;
+
+        // 4. Head block (the actual anchor block)
+        let head_block = Block {
+            slot: head_block_slot,
+            root: head_block_root,
+            parent_root: Some(head_block_parent_root),
+            state_root: head_block_state_root,
+            target_root: head_block_root,
+            current_epoch_shuffling_id,
+            next_epoch_shuffling_id,
+            justified_checkpoint,
+            finalized_checkpoint,
+            execution_status,
+            unrealized_justified_checkpoint: Some(justified_checkpoint),
+            unrealized_finalized_checkpoint: Some(finalized_checkpoint),
+            execution_payload_parent_hash,
+            execution_payload_block_hash,
+            proposer_index: Some(proposer_index),
+        };
+
+        proto_array
+            .on_block::<E>(head_block, current_slot, spec, Duration::ZERO)
+            .map_err(|e| format!("Failed to add head block to proto_array: {:?}", e))?;
+
+        Ok(Self {
+            proto_array,
+            votes: ElasticList::default(),
+            balances: JustifiedBalances::default(),
+        })
+    }
+
     /// See `ProtoArray::propagate_execution_payload_validation` for documentation.
     pub fn process_execution_payload_validation(
         &mut self,
